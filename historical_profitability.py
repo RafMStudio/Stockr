@@ -76,7 +76,7 @@ def evaluate(start,end,slip):
                 balance+=p['notional']*tr['PNL %']/100
             else: remaining.append(p)
         active=remaining
-        equity=balance+sum(p['qty']*p['trade']['side']*(float(marks[p['trade']['TICKER']].loc[ts])-p['trade']['ENTRY'])-p['notional']*.0001 for p in active)
+        equity=balance+sum(p['qty']*p['trade']['side']*(float(frames[p['trade']['TICKER']].loc[ts,'Open'] if ts in frames[p['trade']['TICKER']].index else frames[p['trade']['TICKER']].loc[frames[p['trade']['TICKER']].index < ts,'Close'].iloc[-1])-p['trade']['ENTRY'])-p['notional']*.0001 for p in active)
         for tr in schedule.get(ts,[]):
             if any(p['trade']['TICKER']==tr['TICKER'] for p in active):
                 rejected+=1;continue
