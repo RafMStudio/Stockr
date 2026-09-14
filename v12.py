@@ -6,6 +6,7 @@ import yfinance as yf
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import numpy as np
+from backtest_engine import simulate_deal as _simulate_deal, signal_history
 from scipy.signal import argrelextrema
 import json, os, smtplib, ssl
 from email.mime.text import MIMEText
@@ -306,44 +307,15 @@ def calculate_expert_strategy(df, sensitivity=2, atr_period=10):
     return df
 
 # --- 2b. BACKTEST ENGINE ---
-def backtest_signals(df, target_mult, stop_mult, max_hold=300):
-    """Walk each historical signal forward with ATR-scaled exits.
+def backtest_signals(df, target_mult, stop_mult, max_hold=35):
+    records = signal_history(df, target_mult, stop_mult, max_hold)
+    filled = [r for r in records if r['OUTCOME'] != 'PENDING']
+    closed = [r for r in filled if r['OUTCOME'] != 'OPEN']
+    wr = 100 * sum(r['PNL %'] > 0 for r in closed) / len(closed) if closed else 0
+    # Include marked open losses/gains; this is descriptive, not a forecast.
+    edge = np.mean([r['R'] * stop_mult for r in filled]) if filled else 0
+    return wr, len(closed), edge
 
-    Exits are in units of ATR(14) at entry, so targets/stops adapt to each
-    stock's volatility instead of a fixed percent that means nothing on both
-    MELI and KO. When a bar touches both target and stop, it counts as a LOSS,
-    so the reported win rate is a conservative floor, not an optimistic guess.
-    """
-    highs = df['High'].values; lows = df['Low'].values; closes = df['Close'].values
-    atr = df['ATR'].values
-    n = len(df)
-    wins, losses = 0, 0
-
-    def walk(i, is_long):
-        nonlocal wins, losses
-        if np.isnan(atr[i]) or atr[i] <= 0: return
-        entry = closes[i]
-        if is_long:
-            tgt = entry + target_mult * atr[i]; stp = entry - stop_mult * atr[i]
-        else:
-            tgt = entry - target_mult * atr[i]; stp = entry + stop_mult * atr[i]
-        for j in range(i + 1, min(n, i + 1 + max_hold)):
-            hit_stop = (lows[j] <= stp) if is_long else (highs[j] >= stp)
-            if hit_stop: losses += 1; return
-            hit_tgt = (highs[j] >= tgt) if is_long else (lows[j] <= tgt)
-            if hit_tgt: wins += 1; return
-
-    for i in np.flatnonzero(df['Buy_Signal'].values[:-1]): walk(i, True)
-    for i in np.flatnonzero(df['Sell_Signal'].values[:-1]): walk(i, False)
-
-    trades = wins + losses
-    wr = wins / trades * 100 if trades else 0
-    # Expectancy per trade in ATR units: positive = the system makes money
-    # even after losses; win rate alone can't tell you that.
-    edge = (wins * target_mult - losses * stop_mult) / trades if trades else 0
-    return wr, trades, edge
-
-# --- 3. INDICATOR PROCESSING ---
 def process_stock_data(df, target_mult=0.75, stop_mult=4.0):
     df = calculate_expert_strategy(df)
 
@@ -576,7 +548,7 @@ AGENT_DEFS = [
      'target': 1.0, 'stop': 3.0},
     {'id': 'house', 'name': '🤖 House Bot', 'strategy': 'UT Bot + StochRSI (dashboard strategy)',
      'source': "This dashboard's own strategy: UT Bot trailing state plus a StochRSI oversold cross, filtered by the EMA50/EMA200 regime.",
-     'target': 0.75, 'stop': 4.0},
+     'target': target_mult, 'stop': stop_mult},
     {'id': 'markov', 'name': '🧮 Markov Regime', 'strategy': 'Markov 2.0 — Hedge Fund Method (walk-forward, stride-sampled)',
      'source': "Regime-transition trading: label every 20-day (140-bar) window BULL (≥+5%), BEAR (≤−5%) or SIDEWAYS, "
                "build the state transition matrix from NON-overlapping windows only (overlapping windows share 19 of "
@@ -709,35 +681,6 @@ def _agent_signals(aid, df):
         return F(uptrend & panic & dip & down3), no_sig
     return no_sig, no_sig
 
-def _simulate_deal(df, ts, side, target_mult, stop_mult, max_hold=35):
-    i = df.index.get_loc(ts)
-    atr = df['ATR'].iloc[i]
-    if pd.isna(atr) or atr <= 0 or i >= len(df) - 1: return None
-    entry = df['Close'].iloc[i]
-    tgt = entry + side * target_mult * atr
-    stp = entry - side * stop_mult * atr
-    exit_price = exit_ts = outcome = None
-    end = min(len(df), i + 1 + max_hold)
-    for j in range(i + 1, end):
-        hi, lo = df['High'].iloc[j], df['Low'].iloc[j]
-        # stop checked first: same-bar ambiguity counts against the agent
-        if (lo <= stp) if side == 1 else (hi >= stp):
-            exit_price, exit_ts, outcome = stp, df.index[j], 'LOSS'; break
-        if (hi >= tgt) if side == 1 else (lo <= tgt):
-            exit_price, exit_ts, outcome = tgt, df.index[j], 'WIN'; break
-    if outcome is None:
-        if end == len(df) and (len(df) - 1 - i) < max_hold:
-            exit_price, exit_ts, outcome = df['Close'].iloc[-1], pd.NaT, 'OPEN'
-        else:
-            j = end - 1
-            exit_price, exit_ts = df['Close'].iloc[j], df.index[j]
-            outcome = 'TIME-WIN' if side * (exit_price - entry) > 0 else 'TIME-LOSS'
-    pnl = side * (exit_price - entry) / entry * 100
-    r = side * (exit_price - entry) / (stop_mult * atr)
-    return {'SIDE': 'LONG' if side == 1 else 'SHORT', 'ENTRY TIME': df.index[i],
-            'ENTRY': round(entry, 2), 'EXIT TIME': exit_ts, 'EXIT': round(exit_price, 2),
-            'OUTCOME': outcome, 'PNL %': round(pnl, 2), 'R': round(r, 2)}
-
 def _prepare_agent_frames(bulk, tickers):
     frames = {}
     for t in tickers:
@@ -779,12 +722,16 @@ def _run_agents(frames):
             for ts in df.index[sell]: sigs.append((ts, t, -1))
         sigs.sort(key=lambda x: (x[0], x[1]))
         per_day = {}
+        active_until = {}
         for ts, t, side in sigs:
+            if t in active_until and (active_until[t] is None or ts < active_until[t]):
+                continue
             day = ts.date()
             if per_day.get(day, 0) >= 2: continue  # max 2 deals per day
             rec = _simulate_deal(frames[t], ts, side, agent['target'], agent['stop'],
                                  max_hold=agent.get('hold', 35))
             if rec is None: continue
+            active_until[t] = None if rec['OUTCOME'] in ('OPEN', 'PENDING') else rec['EXIT TIME']
             per_day[day] = per_day.get(day, 0) + 1
             rec['AGENT'] = agent['name']; rec['TICKER'] = t
             trades.append(rec)
@@ -794,7 +741,7 @@ def _run_agents(frames):
     return tdf
 
 @st.cache_data(ttl=3600, show_spinner="🤖 Agents are trading the past year...")
-def build_agent_history(tickers):
+def build_agent_history(tickers, house_target, house_stop):
     return _run_agents(_prepare_agent_frames(download_bulk(tickers), tickers))
 
 # --- EMAIL ALERTS ---
@@ -869,7 +816,7 @@ def render_agents_page():
                "the whole watchlist on **2 years** of hourly data. Each agent takes at most **2 deals per day** "
                "(first valid signals win) with ATR-scaled exits and a time exit. Same rules for every stock — "
                "nothing is tuned per ticker.")
-    tdf = build_agent_history(TICKERS)
+    tdf = build_agent_history(TICKERS, target_mult, stop_mult)
     if tdf.empty:
         st.warning("No agent history could be built — market data unavailable.")
         return
@@ -883,7 +830,7 @@ def render_agents_page():
         st.markdown("#### ⭐ Deals from agents you follow")
         f = tdf[tdf['AGENT'].isin(st.session_state['followed'])]
         latest_day = tdf['ENTRY TIME'].max().normalize()
-        actionable = f[(f['OUTCOME'] == 'OPEN') | (f['ENTRY TIME'] >= latest_day)]
+        actionable = f[(f['OUTCOME'].isin(['OPEN', 'PENDING'])) | (f['ENTRY TIME'] >= latest_day)]
         if actionable.empty:
             st.caption("No open or new deals from your followed agents right now.")
         else:
@@ -909,7 +856,7 @@ def render_agents_page():
     rows = []
     for agent in AGENT_DEFS:
         a = view[view['AGENT'] == agent['name']]
-        closed = a[a['OUTCOME'] != 'OPEN']
+        closed = a[~a['OUTCOME'].isin(['OPEN', 'PENDING'])]
         wins = closed[closed['PNL %'] > 0]; losses = closed[closed['PNL %'] <= 0]
         wr = len(wins) / len(closed) * 100 if len(closed) else 0
         gross_loss = abs(losses['PNL %'].sum())
@@ -917,7 +864,7 @@ def render_agents_page():
         rows.append({'_pnl': closed['PNL %'].sum(),
                      'AGENT': agent['name'], 'STRATEGY': agent['strategy'], 'DEALS': len(a),
                      'WIN RATE': f"{wr:.0f}%",
-                     'TOTAL P&L': f"{closed['PNL %'].sum():+.1f}%",
+                     'SUM OF CLOSED RETURNS': f"{closed['PNL %'].sum():+.1f}%",
                      'AVG/DEAL': f"{closed['PNL %'].mean():+.2f}%" if len(closed) else "—",
                      'TOP LOSS': f"{closed['PNL %'].min():+.2f}%" if len(closed) else "—",
                      'PROFIT FACTOR': "∞" if pf == float('inf') else f"{pf:.2f}",
@@ -925,18 +872,21 @@ def render_agents_page():
     rows.sort(key=lambda r: r['_pnl'], reverse=True)
     lb = pd.DataFrame(rows).drop(columns=['_pnl'])
     st.dataframe(style_table(lb, ()), use_container_width=True)
-    st.caption("P&L assumes equal capital per deal, summed per-deal returns (not compounded). "
-               "Win rate and P&L count closed deals only; OPEN deals are excluded until they resolve.")
+    st.caption("Research simulation, not a funded portfolio. Returns are per-trade sums, not account growth. "
+               "Assumed costs: 5 bps adverse market slippage and 1 bp fee per side; no borrow charges. "
+               "Closed statistics exclude open/pending trades. Open marks are shown separately.")
+    open_marks = view[view['OUTCOME'] == 'OPEN']['PNL %'].sum()
+    st.metric("Sum of Open Trade Marks", f"{open_marks:+.2f}%")
 
     # --- EQUITY CURVES ---
     figeq = go.Figure()
     for agent in AGENT_DEFS:
-        a = view[(view['AGENT'] == agent['name']) & (view['OUTCOME'] != 'OPEN')].sort_values('EXIT TIME')
+        a = view[(view['AGENT'] == agent['name']) & (~view['OUTCOME'].isin(['OPEN', 'PENDING']))].sort_values('EXIT TIME')
         if a.empty: continue
         figeq.add_trace(go.Scatter(x=a['EXIT TIME'], y=a['PNL %'].cumsum(),
                                    mode='lines', name=agent['name']))
     figeq.update_layout(height=400, template=plotly_template, paper_bgcolor=bg_color, plot_bgcolor=bg_color,
-                        title_text="Cumulative P&L per Agent (%)", title_font_color=text_color,
+                        title_text="Sum of Closed Trade Returns (%) — Not Account Equity", title_font_color=text_color,
                         font=dict(color=text_color), margin=dict(l=10, r=10, t=50, b=10),
                         legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0, font=dict(color=text_color)))
     st.plotly_chart(figeq, use_container_width=True, key=f"eq_{plotly_template}")
@@ -948,7 +898,7 @@ def render_agents_page():
     sel = st.selectbox("Agent", [a['name'] for a in AGENT_DEFS], label_visibility="collapsed")
     agent = next(a for a in AGENT_DEFS if a['name'] == sel)
     st.markdown(f"**Strategy:** {agent['strategy']}")
-    st.markdown(f"**Why it works:** {agent['source']}")
+    st.markdown(f"**Strategy rationale:** {agent['source']}")
     st.markdown(f"**Exits:** target +{agent['target']}×ATR / stop −{agent['stop']}×ATR / "
                 f"time exit after ~{agent.get('hold', 35) // 7} trading days")
 
@@ -985,12 +935,12 @@ def render_agents_page():
     else: st.session_state['followed'].discard(sel)
 
     a = view[view['AGENT'] == sel]
-    closed = a[a['OUTCOME'] != 'OPEN']
+    closed = a[~a['OUTCOME'].isin(['OPEN', 'PENDING'])]
     wins = closed[closed['PNL %'] > 0]
     m1, m2, m3, m4, m5, m6 = st.columns(6)
     m1.metric("Deals", len(a))
     m2.metric("Win Rate", f"{(len(wins) / len(closed) * 100):.0f}%" if len(closed) else "—")
-    m3.metric("Total P&L", f"{closed['PNL %'].sum():+.1f}%")
+    m3.metric("Sum of Closed Returns", f"{closed['PNL %'].sum():+.1f}%")
     m4.metric("Avg R", f"{closed['R'].mean():+.2f}" if len(closed) else "—")
     m5.metric("Top Loss", f"{closed['PNL %'].min():+.2f}%" if len(closed) else "—")
     m6.metric("Open Deals", len(a) - len(closed))
@@ -1057,9 +1007,10 @@ avg_edge = sum(d['edge'] for d in traded)/len(traded) if traded else 0
 # win rate still loses money
 breakeven = stop_mult / (stop_mult + target_mult) * 100
 st.info(f"📊 **System Avg Win Rate:** {int(avg_wr)}%  |  **Breakeven:** {breakeven:.0f}%  |  **Avg Edge:** {avg_edge:+.2f} ATR/trade")
-st.caption(f"Exits are volatility-scaled: target +{target_mult}×ATR, stop −{stop_mult}×ATR, same settings for every stock. "
-           "When a candle touches both target and stop, it counts as a loss, so these win rates are a conservative floor. "
-           "A win rate above breakeven means positive expectancy (Avg Edge > 0).")
+st.caption("Hourly completed-bar signals; next-bar open entries; 35-bar time exits. "
+           "Edge includes marked open positions and assumed costs. Win rate counts closed trades only. "
+           "The breakeven figure assumes full target/stop exits before costs; it is not a quality guarantee. "
+           "Scanner tests each ticker separately; House Bot also limits entries to two per day.")
 if failed_tickers:
     st.warning(f"⚠️ {len(failed_tickers)} ticker(s) failed to load and are excluded from the scanner: {', '.join(failed_tickers)}")
 
@@ -1067,10 +1018,10 @@ st.dataframe(style_table(df_summ), use_container_width=True)
 
 # --- SUGGESTED STOCKS FOR TODAY ---
 st.subheader("🎯 Suggested Stocks for Today")
-MIN_TRADES = 5
+MIN_TRADES = 30
 suggestions = []
 for t, d in data.items():
-    # Quality bar: proven edge only - win rate above breakeven, positive
+    # Quality bar: historical screening only - win rate above breakeven, positive
     # expectancy, and enough closed trades that the number means something
     if d['tr'] < MIN_TRADES or d['wr'] <= breakeven or d['edge'] <= 0:
         continue
@@ -1082,9 +1033,9 @@ for t, d in data.items():
 
     reasons = []
     if live_long:
-        action = "💎 LONG NOW"; reasons.append("live buy signal")
+        action = "💎 LONG SIGNAL"; reasons.append("live buy signal")
     elif live_short:
-        action = "🩸 SHORT NOW"; reasons.append("live sell signal")
+        action = "🩸 SHORT SIGNAL"; reasons.append("live sell signal")
     elif uptrend and score >= 8:
         action = "👀 WATCH LONG"; reasons.append(f"strong uptrend ({score}/12 bullish)")
     else:
@@ -1112,7 +1063,7 @@ if df_sugg.empty:
 else:
     st.dataframe(style_table(df_sugg, ('ACTION',)), use_container_width=True)
     st.caption(f"Quality bar: win rate above breakeven ({breakeven:.0f}%), positive edge, ≥{MIN_TRADES} closed trades. "
-               "Live signals rank above watchlist setups, then by edge. Top 10 shown.")
+               "Historical ranking is in-sample, not proven predictive performance. Top 10 shown.")
 
 st.divider()
 
