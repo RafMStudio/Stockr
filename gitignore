@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+
+# subscriber emails and real SMTP credentials stay out of git
+subscriptions.json
+.streamlit/secrets.toml
