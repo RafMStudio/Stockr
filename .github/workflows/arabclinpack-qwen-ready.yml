@@ -20,7 +20,8 @@ jobs:
       TRAIN_POOL: "384"
       EVAL_N: "64"
       MAX_LEN: "180"
-      LR: "0.0015"\n      TARGET_REDUCTION: "0.30"
+      LR: "0.0015"
+      TARGET_REDUCTION: "0.30"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
