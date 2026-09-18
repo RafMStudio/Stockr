@@ -1,0 +1,76 @@
+name: ArabClinPack Qwen 0.5B Eval
+on:
+  push:
+    branches: [arabclinpack-qwen-eval]
+    paths:
+      - 'arabclinpack_eval/**'
+      - '.github/workflows/arabclinpack-qwen-eval.yml'
+  workflow_dispatch:
+
+jobs:
+  qwen-eval:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      MODEL_ID: Qwen/Qwen2.5-0.5B-Instruct
+      HF_HUB_DISABLE_XET: "1"
+      TOKENIZERS_PARALLELISM: "false"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Reconstruct frozen ArabClinPack v1.2
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p arabclinpack_eval/core
+          cat arabclinpack_eval/chunks/part{1..6}.b64 | base64 -d > /tmp/acp_core.tar.xz
+          echo "1b4854b650decf97bd685732cec7bbec77320c532f6d2233789cf9ca5af4c864  /tmp/acp_core.tar.xz" | sha256sum -c -
+          tar -xJf /tmp/acp_core.tar.xz -C arabclinpack_eval/core
+          base64 -d arabclinpack_eval/benchmark.b64 | xz -d > arabclinpack_eval/model_eval_qwen.py
+          python -m py_compile arabclinpack_eval/model_eval_qwen.py
+          test "$(python - <<'PY'
+from pathlib import Path
+import hashlib
+files=['data/concepts.json','data/learned_spans.json','data/morphology.json','data/factorization.json','data/fusion_fragments.json']
+root=Path('arabclinpack_eval/core')
+h=hashlib.sha256()
+for rel in files:
+    h.update(rel.encode()); h.update(b'\0'); h.update((root/rel).read_bytes()); h.update(b'\0')
+print(h.hexdigest())
+PY
+)" = "5dbb2ca2a9c8737bcc2a0f22fea61907bdc5f612458841ebd689c7dd8dc59bbe"
+      - name: Install CPU model runtime
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
+          python -m pip install "transformers>=4.45,<5" sentencepiece psutil safetensors
+      - name: Run real Qwen2.5 0.5B benchmark
+        env:
+          ACP_ROOT: arabclinpack_eval/core
+          OUT_JSON: arabclinpack_eval/results_qwen.json
+        run: python arabclinpack_eval/model_eval_qwen.py
+      - name: Write summary
+        if: always()
+        shell: bash
+        run: |
+          if [ -f arabclinpack_eval/results_qwen.json ]; then
+            python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+import json
+r=json.load(open('arabclinpack_eval/results_qwen.json'))
+a=r['aggregate']
+print('# ArabClinPack v1.2 × Qwen2.5-0.5B-Instruct')
+for k,v in a.items():
+    print(f'- **{k}**: {v}')
+PY
+          else
+            echo "Benchmark did not produce results_qwen.json" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload benchmark artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: arabclinpack-qwen-0.5b-results
+          path: |
+            arabclinpack_eval/results_qwen.json
